@@ -6,11 +6,25 @@ const { scrapeWebsite, loadExistingFiles } = require('../scrape');
 
 router.post('/', async (req, res) => {
     try {
+        console.log('\n=== New Scrape Request ===');
         const { url, maxDepth = 3, force = false } = req.body;
+        
         if (!url) {
+            console.error('Missing URL in request');
             return res.status(400).json({
                 error: true,
                 message: 'URL is required'
+            });
+        }
+
+        // Validate URL format
+        try {
+            new URL(url);
+        } catch (e) {
+            console.error('Invalid URL format:', url);
+            return res.status(400).json({
+                error: true,
+                message: 'Invalid URL format'
             });
         }
 
@@ -33,10 +47,24 @@ router.post('/', async (req, res) => {
         const startTime = Date.now();
 
         const result = await scrapeWebsite(url, maxDepth, 0, existingFiles);
+        
+        if (!result) {
+            console.error('Scraping failed - no result returned');
+            return res.status(500).json({
+                error: true,
+                message: 'Scraping failed - no content retrieved',
+                startUrl: url
+            });
+        }
 
         const endTime = Date.now();
         const timeElapsed = (endTime - startTime) / 1000;
-
+        
+        const uploadsPath = path.join(__dirname, '../uploads');
+        const filesProcessed = fs.readdirSync(uploadsPath).filter(f => f.endsWith('.md')).length;
+        
+        console.log(`Scraping completed in ${timeElapsed}s, processed ${filesProcessed} files`);
+        
         res.status(200).json({
             message: 'Scraping completed',
             startUrl: url,
