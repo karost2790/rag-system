@@ -14,6 +14,15 @@ const RETRY_DELAY = 2000; // 2 seconds
 const visitedUrls = new Set();
 const urlToFileMap = new Map();
 
+// Initialize logging
+const initScraping = (url) => {
+    console.log('\n=== Starting new scraping session ===');
+    console.log('Initial URL:', url);
+    console.log('Time:', new Date().toISOString());
+    visitedUrls.clear();
+    urlToFileMap.clear();
+};
+
 // Ensure directories exist
 if (!fs.existsSync(uploadsDir)) {
     console.log('Creating uploads directory:', uploadsDir);
@@ -123,7 +132,19 @@ async function launchBrowserWithRetry(retries = MAX_RETRIES) {
 }
 
 async function scrapeWebsite(baseUrl, maxDepth = 3, currentDepth = 0, existingFiles) {
+    if (currentDepth === 0) {
+        initScraping(baseUrl);
+    }
+    
     console.log(`\nProcessing ${baseUrl} at depth ${currentDepth}`);
+    
+    // Validate URL
+    try {
+        new URL(baseUrl);
+    } catch (e) {
+        console.error('Invalid URL:', baseUrl);
+        throw new Error(`Invalid URL: ${baseUrl}`);
+    }
     
     if (currentDepth > maxDepth) {
         console.log(`Skipping ${baseUrl} - Max depth reached`);
@@ -169,10 +190,19 @@ async function scrapeWebsite(baseUrl, maxDepth = 3, currentDepth = 0, existingFi
             });
 
             console.log(`Loading page: ${baseUrl}`);
-            await page.goto(baseUrl, { 
+            console.log(`Navigating to ${baseUrl}...`);
+            const response = await page.goto(baseUrl, { 
                 waitUntil: ['domcontentloaded', 'networkidle0'],
                 timeout: 30000 
             });
+            
+            if (!response.ok()) {
+                throw new Error(`Failed to load page: ${response.status()} ${response.statusText()}`);
+            }
+            
+            // Store the mapping
+            const filename = createMarkdownFilename(baseUrl);
+            urlToFileMap.set(baseUrl, filename);
             
             console.log('Waiting for content to load...');
             await page.waitForFunction(() => {
