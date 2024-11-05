@@ -10,3 +10,21 @@
   "author": "",
   "license": "ISC"
 }
+{
+  "name": "rag-system",
+  "version": "1.0.0",
+  "description": "RAG System for LangChain documentation",
+  "main": "index.js",
+  "scripts": {
+    "start": "node backend/server.js",
+    "dev": "concurrently \"npm run server\" \"npm run client\"",
+    "server": "cd backend && npm run dev",
+    "client": "cd frontend && npm start"
+  },
+  "keywords": ["rag", "langchain", "documentation"],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "concurrently": "^8.2.0"
+  }
+}
