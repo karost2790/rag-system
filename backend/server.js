@@ -24,6 +24,7 @@ if (!fs.existsSync(uploadsDir)) {
 // Routes
 app.use('/api/upload', uploadRouter);
 app.use('/api/scrape', scrapeRouter);
+app.use('/api/url/scrape', scrapeRouter); // Add alias route
 
 // Error handling middleware
 app.use((err, req, res, next) => {
