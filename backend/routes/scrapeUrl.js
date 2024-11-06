@@ -2,7 +2,7 @@ const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const router = express.Router();
-const { initiateScrapingJob } = require('../scrape');
+const scraper = require('../scrape');
 
 router.post('/', async (req, res) => {
     try {
@@ -30,7 +30,7 @@ router.post('/', async (req, res) => {
         }
         
         const startTime = Date.now();
-        const result = await initiateScrapingJob(url, maxDepth, force);
+        const result = await scraper.initiateScrapingJob(url, maxDepth, force);
         const endTime = Date.now();
         const timeElapsed = (endTime - startTime) / 1000;
 
