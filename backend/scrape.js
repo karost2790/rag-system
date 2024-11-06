@@ -188,7 +188,30 @@ async function saveToMarkdown(content, outputPath) {
     }
 }
 
+async function initiateScrapingJob(url, maxDepth, force = false) {
+    console.log('\n=== Starting new scraping job ===');
+    console.log('URL:', url);
+    console.log('Max depth:', maxDepth);
+    console.log('Force:', force);
+
+    // Reset global state
+    visitedUrls.clear();
+    urlToFileMap.clear();
+
+    try {
+        const result = await scrapeWebsite(url, maxDepth);
+        if (!result) {
+            throw new Error('Scraping failed - no content retrieved');
+        }
+        return result;
+    } catch (error) {
+        console.error('Scraping job failed:', error);
+        throw error;
+    }
+}
+
 module.exports = {
     scrapeWebsite,
-    saveToMarkdown
+    saveToMarkdown,
+    initiateScrapingJob
 };
