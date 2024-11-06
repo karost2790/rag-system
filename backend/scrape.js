@@ -3,105 +3,177 @@ const fs = require('fs');
 const path = require('path');
 const URL = require('url').URL;
 
-// Constants
-const SINGLE_PAGE_TIMEOUT = 30 * 1000; // 30 seconds per page
-const ERROR_LOG_PATH = path.join(__dirname, 'error_log.txt');
-const uploadsDir = path.join(__dirname, 'uploads');
-const MAX_RETRIES = 3;
-const RETRY_DELAY = 2000; // 2 seconds
-
-// Global state
 const visitedUrls = new Set();
 const urlToFileMap = new Map();
 
-// Initialize logging
-const initScraping = (url) => {
-    console.log('\n=== Starting new scraping session ===');
-    console.log('Initial URL:', url);
-    console.log('Time:', new Date().toISOString());
-    visitedUrls.clear();
-    urlToFileMap.clear();
-};
-
-// Ensure directories exist
+const uploadsDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadsDir)) {
     console.log('Creating uploads directory:', uploadsDir);
     fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-// Browser launch options
-const BROWSER_OPTIONS = {
-    headless: 'new',
-    args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--disable-extensions',
-        '--window-size=800x600',
-        '--disable-notifications',
-        '--blink-settings=imagesEnabled=false'
-    ],
-    ignoreHTTPSErrors: true,
-    timeout: 30000
-};
-
-// Helper functions
-const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-function timeoutPromise(promise, ms) {
-    return Promise.race([
-        promise,
-        new Promise((_, reject) => 
-            setTimeout(() => reject(new Error(`Operation timed out after ${ms}ms`)), ms)
-        )
-    ]);
-}
-
-function logError(message) {
-    const timestamp = new Date().toISOString();
-    const logMessage = `${timestamp}: ${message}\n`;
-    fs.appendFileSync(ERROR_LOG_PATH, logMessage);
-    console.error(logMessage.trim());
-}
-
-function loadExistingFiles() {
-    console.log('Checking existing files in:', uploadsDir);
-    const files = fs.readdirSync(uploadsDir);
-    console.log(`Found ${files.length} existing files in uploads directory`);
-    return files.reduce((map, filename) => {
-        const filePath = path.join(uploadsDir, filename);
-        const stats = fs.statSync(filePath);
-        map.set(filename, stats.mtime);
-        return map;
-    }, new Map());
-}
-
 function createMarkdownFilename(url) {
     const urlObj = new URL(url);
-    let filename = urlObj.pathname.replace(/\//g, '_').replace(/^_/, '').replace(/_$/, '');
-    
-    // Handle special cases
-    if (!filename) {
-        filename = 'index';
-    } else if (filename === 'docs') {
-        filename = 'docs_index';
-    }
-    
-    // Ensure .md extension
-    if (!filename.endsWith('.md')) {
-        filename = `${filename}.md`;
-    }
-    
+    const filename = `${urlObj.pathname.replace(/\//g, '_')}.md`
+        .replace(/^_/, '')
+        .replace(/_$/, '')
+        .replace(/^docs_/, '');
     console.log('Created filename:', filename, 'for URL:', url);
     return filename;
+}
+
+// Helper function to wait
+const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function scrapeWebsite(baseUrl, maxDepth = 2, currentDepth = 0) {
+    console.log(`Scraping ${baseUrl} at depth ${currentDepth}`);
+    
+    if (currentDepth > maxDepth || visitedUrls.has(baseUrl)) {
+        console.log(`Skipping ${baseUrl} (depth: ${currentDepth}, visited: ${visitedUrls.has(baseUrl)})`);
+        return null;
+    }
+    
+    visitedUrls.add(baseUrl);
+    const filename = createMarkdownFilename(baseUrl);
+    urlToFileMap.set(baseUrl, filename);
+
+    let browser;
+    try {
+        console.log('Launching browser...');
+        browser = await puppeteer.launch({
+            headless: 'new'
+        });
+        const page = await browser.newPage();
+
+        // Add console log listener
+        page.on('console', msg => console.log('Browser console:', msg.text()));
+
+        async function loadPageWithRetry(retries = 3) {
+            for (let i = 0; i < retries; i++) {
+                try {
+                    console.log(`Attempting to load ${baseUrl} (attempt ${i + 1})`);
+                    await page.goto(baseUrl, { waitUntil: 'networkidle0', timeout: 30000 });
+                    // Wait for main content selectors
+                    await Promise.race([
+                        page.waitForSelector('nav', { timeout: 5000 }),
+                        page.waitForSelector('main', { timeout: 5000 }),
+                        page.waitForSelector('article', { timeout: 5000 })
+                    ]).catch(() => console.log('Some expected elements not found'));
+                    
+                    // Additional wait for dynamic content
+                    await wait(2000);
+                    return true;
+                } catch (error) {
+                    console.error(`Attempt ${i + 1} failed:`, error);
+                    if (i === retries - 1) throw error;
+                    await wait(2000);
+                }
+            }
+        }
+
+        await loadPageWithRetry();
+        console.log('Page loaded successfully');
+
+        // Extract content and links
+        const { content, links } = await page.evaluate(() => {
+            const sections = [];
+            const relatedLinks = new Set();
+            
+            // Helper function to process links
+            function addLink(href) {
+                try {
+                    const url = new URL(href);
+                    if (url.pathname.startsWith('/docs')) {
+                        relatedLinks.add(url.href);
+                    }
+                } catch (e) {
+                    // Invalid URL, skip it
+                }
+            }
+
+            // Get all navigation links
+            document.querySelectorAll('nav a, aside a, .sidebar a, .navigation a').forEach(link => {
+                if (link.href) addLink(link.href);
+            });
+
+            // Extract text content
+            document.querySelectorAll('main h1, main h2, main h3, main p, main pre, main code, article h1, article h2, article h3, article p, article pre, article code').forEach(node => {
+                if (node.tagName === 'H1') {
+                    sections.push(`# ${node.innerText.trim()}`);
+                } 
+                else if (node.tagName === 'H2') {
+                    sections.push(`## ${node.innerText.trim()}`);
+                }
+                else if (node.tagName === 'H3') {
+                    sections.push(`### ${node.innerText.trim()}`);
+                }
+                else if (node.tagName === 'P') {
+                    const text = node.innerText.trim();
+                    if (text) {
+                        sections.push(text);
+                        // Check for links within paragraphs
+                        node.querySelectorAll('a').forEach(link => {
+                            if (link.href) addLink(link.href);
+                        });
+                    }
+                }
+                else if (node.tagName === 'PRE' || node.tagName === 'CODE') {
+                    const code = node.innerText.trim();
+                    if (code) sections.push(`\`\`\`\n${code}\n\`\`\``);
+                }
+            });
+
+            console.log(`Found ${relatedLinks.size} related links`);
+            return {
+                content: sections.join('\n\n'),
+                links: Array.from(relatedLinks)
+            };
+        });
+
+        console.log(`Found ${links.length} related links:`, links);
+
+        // Add navigation section
+        const navSection = `## Navigation\n\nYou are here: ${baseUrl}\n\nRelated pages:\n${
+            Array.from(urlToFileMap.entries())
+                .map(([url, fname]) => `- [${url}](./${fname})`)
+                .join('\n')
+        }\n\n---\n\n`;
+
+        const finalContent = navSection + content;
+
+        // Save the content
+        const outputPath = path.join(uploadsDir, filename);
+        console.log('Saving content to:', outputPath);
+        
+        await saveToMarkdown(finalContent, outputPath);
+
+        // Recursively scrape related pages
+        console.log(`Starting to scrape ${links.length} related pages...`);
+        for (const link of links) {
+            await scrapeWebsite(link, maxDepth, currentDepth + 1);
+        }
+
+        return {
+            url: baseUrl,
+            filename: filename,
+            relatedLinks: links
+        };
+
+    } catch (error) {
+        console.error(`Error scraping ${baseUrl}:`, error);
+        return null;
+    } finally {
+        if (browser) {
+            await browser.close();
+        }
+    }
 }
 
 async function saveToMarkdown(content, outputPath) {
     try {
         console.log('Writing file:', outputPath);
         const dir = path.dirname(outputPath);
-        if (!fs.existsSync(dir)) {
+        if (!fs.existsSync(dir)){
             console.log('Creating directory:', dir);
             fs.mkdirSync(dir, { recursive: true });
         }
@@ -116,234 +188,7 @@ async function saveToMarkdown(content, outputPath) {
     }
 }
 
-async function launchBrowserWithRetry(retries = MAX_RETRIES) {
-    for (let i = 0; i < retries; i++) {
-        try {
-            console.log(`Attempting to launch browser (attempt ${i + 1})`);
-            const browser = await puppeteer.launch(BROWSER_OPTIONS);
-            console.log('Browser launched successfully');
-            return browser;
-        } catch (error) {
-            console.error(`Browser launch attempt ${i + 1} failed:`, error.message);
-            if (i === retries - 1) throw error;
-            await wait(RETRY_DELAY);
-        }
-    }
-}
-
-async function scrapeWebsite(baseUrl, maxDepth = 3, currentDepth = 0, existingFiles) {
-    if (currentDepth === 0) {
-        initScraping(baseUrl);
-    }
-    
-    console.log(`\nProcessing ${baseUrl} at depth ${currentDepth}`);
-    
-    // Validate URL
-    try {
-        new URL(baseUrl);
-    } catch (e) {
-        console.error('Invalid URL:', baseUrl);
-        throw new Error(`Invalid URL: ${baseUrl}`);
-    }
-    
-    if (currentDepth > maxDepth) {
-        console.log(`Skipping ${baseUrl} - Max depth reached`);
-        return null;
-    }
-    
-    if (visitedUrls.has(baseUrl)) {
-        console.log(`Skipping ${baseUrl} - Already visited`);
-        return null;
-    }
-
-    const filename = createMarkdownFilename(baseUrl);
-    
-    if (existingFiles.has(filename)) {
-        console.log(`File ${filename} already exists, skipping...`);
-        visitedUrls.add(baseUrl);
-        return { url: baseUrl, filename, status: 'existing' };
-    }
-
-    visitedUrls.add(baseUrl);
-    let browser;
-    
-    try {
-        console.log('\nStarting new scraping operation...');
-        const result = await timeoutPromise(async () => {
-            browser = await launchBrowserWithRetry();
-            const page = await browser.newPage();
-            
-            // Setup page logging
-            page.on('console', msg => console.log('Browser console:', msg.text()));
-            page.on('error', err => console.error('Browser error:', err));
-            page.on('pageerror', err => console.error('Page error:', err));
-
-            // Block unnecessary resources
-            await page.setRequestInterception(true);
-            page.on('request', (request) => {
-                const resourceType = request.resourceType();
-                if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
-                    request.abort();
-                } else {
-                    request.continue();
-                }
-            });
-
-            console.log(`Loading page: ${baseUrl}`);
-            console.log(`Navigating to ${baseUrl}...`);
-            const response = await page.goto(baseUrl, { 
-                waitUntil: ['domcontentloaded', 'networkidle0'],
-                timeout: 30000 
-            });
-            
-            if (!response.ok()) {
-                throw new Error(`Failed to load page: ${response.status()} ${response.statusText()}`);
-            }
-            
-            // Store the mapping
-            const filename = createMarkdownFilename(baseUrl);
-            urlToFileMap.set(baseUrl, filename);
-            
-            console.log('Waiting for content to load...');
-            await page.waitForFunction(() => {
-                const content = document.querySelector('main') || 
-                              document.querySelector('article') || 
-                              document.querySelector('.docContent');
-                return content && content.innerText.length > 0;
-            }, { timeout: 10000 }).catch(e => console.log('Content wait timeout:', e.message));
-
-            console.log('Extracting content...');
-            const { content, links } = await page.evaluate(() => {
-                try {
-                    console.log('Starting content extraction...');
-                    const sections = [];
-                    const relatedLinks = new Set();
-
-                    // Find main content
-                    const mainContent = document.querySelector('main') || 
-                                      document.querySelector('article') || 
-                                      document.querySelector('.docContent');
-                    
-                    if (!mainContent) {
-                        console.log('No main content found');
-                        return { content: '', links: [] };
-                    }
-
-                    // Extract content
-                    mainContent.querySelectorAll('h1, h2, h3, p, pre, code').forEach(node => {
-                        const text = node.innerText.trim();
-                        if (text) {
-                            if (node.tagName === 'H1') sections.push(`# ${text}`);
-                            else if (node.tagName === 'H2') sections.push(`## ${text}`);
-                            else if (node.tagName === 'H3') sections.push(`### ${text}`);
-                            else if (node.tagName === 'PRE' || node.tagName === 'CODE') 
-                                sections.push(`\`\`\`\n${text}\n\`\`\``);
-                            else sections.push(text);
-                        }
-                    });
-
-                    // Extract links
-                    document.querySelectorAll('a').forEach(link => {
-                        try {
-                            const url = new URL(link.href);
-                            if (url.pathname.startsWith('/docs')) {
-                                relatedLinks.add(link.href);
-                            }
-                        } catch (e) {}
-                    });
-
-                    console.log(`Found ${sections.length} content sections and ${relatedLinks.size} links`);
-                    return {
-                        content: sections.join('\n\n'),
-                        links: Array.from(relatedLinks)
-                    };
-                } catch (e) {
-                    console.error('Error in content extraction:', e);
-                    return { content: '', links: [] };
-                }
-            });
-
-            if (!content) {
-                throw new Error('No content extracted from page');
-            }
-
-            console.log(`Content extracted successfully (${content.length} characters)`);
-
-            // Add navigation
-            const navSection = `## Navigation\n\nYou are here: ${baseUrl}\n\nRelated pages:\n${
-                Array.from(urlToFileMap.entries())
-                    .map(([url, fname]) => `- [${url}](./${fname})`)
-                    .join('\n')
-            }\n\n---\n\n`;
-
-            const finalContent = navSection + content;
-            
-            // Save content
-            const outputPath = path.join(uploadsDir, filename);
-            await saveToMarkdown(finalContent, outputPath);
-
-            return { content: finalContent, links };
-        }, SINGLE_PAGE_TIMEOUT);
-
-        // Process found links
-        if (result.links && result.links.length > 0) {
-            console.log(`\nProcessing ${result.links.length} found links...`);
-            const relatedPages = [];
-
-            for (const link of result.links) {
-                try {
-                    console.log(`\nProcessing link: ${link}`);
-                    const childResult = await scrapeWebsite(link, maxDepth, currentDepth + 1, existingFiles);
-                    if (childResult) {
-                        relatedPages.push(childResult);
-                    }
-                    await wait(1000); // Delay between pages
-                } catch (error) {
-                    logError(`Failed to process ${link}: ${error.message}`);
-                }
-            }
-
-            return {
-                url: baseUrl,
-                filename,
-                status: 'success',
-                relatedPages
-            };
-        }
-
-        return {
-            url: baseUrl,
-            filename,
-            status: 'success',
-            relatedPages: []
-        };
-
-    } catch (error) {
-        logError(`Error processing ${baseUrl}: ${error.message}`);
-        const errorContent = `# Error Scraping ${baseUrl}\n\nFailed to scrape this page on ${new Date().toISOString()}\n\nError: ${error.message}`;
-        const outputPath = path.join(uploadsDir, filename);
-        await saveToMarkdown(errorContent, outputPath);
-        
-        return {
-            url: baseUrl,
-            filename,
-            status: 'error',
-            error: error.message
-        };
-    } finally {
-        if (browser) {
-            try {
-                await browser.close();
-                console.log('Browser closed successfully');
-            } catch (error) {
-                console.error('Error closing browser:', error.message);
-            }
-        }
-    }
-}
-
 module.exports = {
     scrapeWebsite,
-    saveToMarkdown,
-    loadExistingFiles
+    saveToMarkdown
 };
