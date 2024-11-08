@@ -14,10 +14,28 @@ if (!fs.existsSync(uploadsDir)) {
 
 function createMarkdownFilename(url) {
     const urlObj = new URL(url);
-    const filename = `${urlObj.pathname.replace(/\//g, '_')}.md`
-        .replace(/^_/, '')
-        .replace(/_$/, '')
-        .replace(/^docs_/, '');
+    let filename = urlObj.pathname.replace(/\//g, '_').replace(/^_/, '').replace(/_$/, '');
+
+    // Extract the hostname and remove subdomains and suffixes
+    let domain = urlObj.hostname.split('.').slice(-2, -1)[0]; // Gets 'example' from 'www.example.com'
+    let rootx = filename.split('_').slice(1).join('_');
+    // If you want to ensure no common TLD (like .com, .net, etc.) remains
+    domain = domain.replace(/\.(com|net|org|edu)$/, '');
+    
+    if (!filename) {
+        filename = `${domain}_index`;
+    } else if (filename === 'docs') {
+        filename = `${domain}_index2`;
+    } else {
+        rootx = filename.split('_').slice(1).join('_'); 
+        filename = `${domain}_${rootx}`;
+    }
+    
+    if (!filename.endsWith('.md')) {
+        filename = `${filename}.md`;
+    }
+    
+
     console.log('Created filename:', filename, 'for URL:', url);
     return filename;
 }
