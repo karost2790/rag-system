@@ -5,37 +5,58 @@
 The RAG System will automate the process of scraping and organizing LangChain documentation into Markdown files, index the content in a vector database, and provide a web-based chat interface. This system will support adding multiple Markdown files and custom URLs for scraping, making it flexible and easy to maintain. The integration with a language model (LLM), such as Aider or Claude-3.5, will ensure contextually rich and accurate responses.
 
 ---
+## Running job
+```
+# remove old mode
+sudo rm -rf backend/uploads/*.md
 
+# start server
+cd backend && node server.js
+
+# at client
+curl -X POST -H "Content-Type: application/json" -d '{"url":"https://docs.langchain.com/docs/", "maxDepth": 3, "force": true}' http://localhost:3000/api/url/scrape
+
+
+curl -X POST -H "Content-Type: application/json" -d '{"url":"https://docs.langchain.com/docs/", "maxDepth": 3, "force": true}' http://localhost:3000/api/url/scrape
+
+curl -X POST -H "Content-Type: application/json" -d '{"url":"https://docs.langchain.com/docs/", "maxDepth": 2}' http://localhost:3000/api/url/scrape
+
+```
+---
 ## Project Directory Structure
 The project will be organized as follows:
 
 ```
+tree -I 'node_modules'
 RAG-System/
-│
-├── backend/
-│   ├── indexData.js
+├── RAG-Project.md
+├── backend
+│   ├── error_log.txt
+│   ├── package-lock.json
+│   ├── package.json
+│   ├── routes
+│   │   ├── scrapeUrl.js
+│   │   ├── uploadMarkdown.js
+│   │   └── uploads
 │   ├── scrape.js
 │   ├── server.js
-│   ├── routes/
-│   │   ├── uploadMarkdown.js
-│   │   └── scrapeUrl.js
-│   ├── utils/
-│   │   └── indexData.js
-│   └── .env
-│
-├── frontend/
-│   ├── public/
-│   ├── src/
-│   │   ├── components/
-│   │   │   ├── Chat.js
-│   │   │   └── UpdateContent.js
-│   │   ├── App.js
-│   │   └── index.js
-│   └── package.json
-│
-├── docker-compose.yml
-├── README.md
+│   ├── uploads
+│   └── utils
+│       └── indexData.js
+├── code-block.md
+├── frontend
+│   ├── package.json
+│   ├── public
+│   └── src
+│       ├── App.js
+│       ├── components
+│       │   ├── Chat.js
+│       │   └── UpdateContent.js
+│       └── index.js
+├── package-lock.json
 └── package.json
+
+10 directories, 17 files
 ```
 
 ---
@@ -71,41 +92,241 @@ RAG-System/
 ```javascript
 const puppeteer = require('puppeteer');
 const fs = require('fs');
-const MarkdownIt = require('markdown-it');
-const md = new MarkdownIt();
+const path = require('path');
+const URL = require('url').URL;
 
-(async () => {
-    const browser = await puppeteer.launch();
-    const page = await browser.newPage();
+const visitedUrls = new Set();
+const urlToFileMap = new Map();
 
-    async function fetchWithRetries(page, url, retries = 3) {
-        for (let i = 0; i < retries; i++) {
-            try {
-                await page.goto(url, { waitUntil: 'networkidle2' });
-                await page.waitForSelector('h1');
-                return true;
-            } catch (error) {
-                console.error(`Attempt ${i + 1} failed:`, error);
-                if (i === retries - 1) throw error;
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) {
+    console.log('Creating uploads directory:', uploadsDir);
+    fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+function createMarkdownFilename(url) {
+    const urlObj = new URL(url);
+    let filename = urlObj.pathname.replace(/\//g, '_').replace(/^_/, '').replace(/_$/, '');
+
+    // Extract the hostname and remove subdomains and suffixes
+    let domain = urlObj.hostname.split('.').slice(-2, -1)[0]; // Gets 'example' from 'www.example.com'
+    let rootx = filename.split('_').slice(1).join('_');
+    // If you want to ensure no common TLD (like .com, .net, etc.) remains
+    domain = domain.replace(/\.(com|net|org|edu)$/, '');
+    
+    if (!filename) {
+        filename = `${domain}_index`;
+    } else if (filename === 'docs') {
+        filename = `${domain}_index2`;
+    } else {
+        rootx = filename.split('_').slice(1).join('_'); 
+        filename = `${domain}_${rootx}`;
+    }
+    
+    if (!filename.endsWith('.md')) {
+        filename = `${filename}.md`;
+    }
+    
+
+    console.log('Created filename:', filename, 'for URL:', url);
+    return filename;
+}
+
+// Helper function to wait
+const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function scrapeWebsite(baseUrl, maxDepth = 2, currentDepth = 0) {
+    console.log(`Scraping ${baseUrl} at depth ${currentDepth}`);
+    
+    if (currentDepth > maxDepth || visitedUrls.has(baseUrl)) {
+        console.log(`Skipping ${baseUrl} (depth: ${currentDepth}, visited: ${visitedUrls.has(baseUrl)})`);
+        return null;
+    }
+    
+    visitedUrls.add(baseUrl);
+    const filename = createMarkdownFilename(baseUrl);
+    urlToFileMap.set(baseUrl, filename);
+
+    let browser;
+    try {
+        console.log('Launching browser...');
+        browser = await puppeteer.launch({
+            headless: 'new'
+        });
+        const page = await browser.newPage();
+
+        // Add console log listener
+        page.on('console', msg => console.log('Browser console:', msg.text()));
+
+        async function loadPageWithRetry(retries = 3) {
+            for (let i = 0; i < retries; i++) {
+                try {
+                    console.log(`Attempting to load ${baseUrl} (attempt ${i + 1})`);
+                    await page.goto(baseUrl, { waitUntil: 'networkidle0', timeout: 30000 });
+                    // Wait for main content selectors
+                    await Promise.race([
+                        page.waitForSelector('nav', { timeout: 5000 }),
+                        page.waitForSelector('main', { timeout: 5000 }),
+                        page.waitForSelector('article', { timeout: 5000 })
+                    ]).catch(() => console.log('Some expected elements not found'));
+                    
+                    // Additional wait for dynamic content
+                    await wait(2000);
+                    return true;
+                } catch (error) {
+                    console.error(`Attempt ${i + 1} failed:`, error);
+                    if (i === retries - 1) throw error;
+                    await wait(2000);
+                }
             }
         }
+
+        await loadPageWithRetry();
+        console.log('Page loaded successfully');
+
+        // Extract content and links
+        const { content, links } = await page.evaluate(() => {
+            const sections = [];
+            const relatedLinks = new Set();
+            
+            // Helper function to process links
+            function addLink(href) {
+                try {
+                    const url = new URL(href);
+                    if (url.pathname.startsWith('/docs')) {
+                        relatedLinks.add(url.href);
+                    }
+                } catch (e) {
+                    // Invalid URL, skip it
+                }
+            }
+
+            // Get all navigation links
+            document.querySelectorAll('nav a, aside a, .sidebar a, .navigation a').forEach(link => {
+                if (link.href) addLink(link.href);
+            });
+
+            // Extract text content
+            document.querySelectorAll('main h1, main h2, main h3, main p, main pre, main code, article h1, article h2, article h3, article p, article pre, article code').forEach(node => {
+                if (node.tagName === 'H1') {
+                    sections.push(`# ${node.innerText.trim()}`);
+                } 
+                else if (node.tagName === 'H2') {
+                    sections.push(`## ${node.innerText.trim()}`);
+                }
+                else if (node.tagName === 'H3') {
+                    sections.push(`### ${node.innerText.trim()}`);
+                }
+                else if (node.tagName === 'P') {
+                    const text = node.innerText.trim();
+                    if (text) {
+                        sections.push(text);
+                        // Check for links within paragraphs
+                        node.querySelectorAll('a').forEach(link => {
+                            if (link.href) addLink(link.href);
+                        });
+                    }
+                }
+                else if (node.tagName === 'PRE' || node.tagName === 'CODE') {
+                    const code = node.innerText.trim();
+                    if (code) sections.push(`\`\`\`\n${code}\n\`\`\``);
+                }
+            });
+
+            console.log(`Found ${relatedLinks.size} related links`);
+            return {
+                content: sections.join('\n\n'),
+                links: Array.from(relatedLinks)
+            };
+        });
+
+        console.log(`Found ${links.length} related links:`, links);
+
+        // Add navigation section
+        const navSection = `## Navigation\n\nYou are here: ${baseUrl}\n\nRelated pages:\n${
+            Array.from(urlToFileMap.entries())
+                .map(([url, fname]) => `- [${url}](./${fname})`)
+                .join('\n')
+        }\n\n---\n\n`;
+
+        const finalContent = navSection + content;
+
+        // Save the content
+        const outputPath = path.join(uploadsDir, filename);
+        console.log('Saving content to:', outputPath);
+        
+        await saveToMarkdown(finalContent, outputPath);
+
+        // Recursively scrape related pages
+        console.log(`Starting to scrape ${links.length} related pages...`);
+        for (const link of links) {
+            await scrapeWebsite(link, maxDepth, currentDepth + 1);
+        }
+
+        return {
+            url: baseUrl,
+            filename: filename,
+            relatedLinks: links
+        };
+
+    } catch (error) {
+        console.error(`Error scraping ${baseUrl}:`, error);
+        return null;
+    } finally {
+        if (browser) {
+            await browser.close();
+        }
     }
+}
 
-    await fetchWithRetries(page, 'https://langchain.com/docs');
+async function saveToMarkdown(content, outputPath) {
+    try {
+        console.log('Writing file:', outputPath);
+        const dir = path.dirname(outputPath);
+        if (!fs.existsSync(dir)){
+            console.log('Creating directory:', dir);
+            fs.mkdirSync(dir, { recursive: true });
+        }
+        
+        fs.writeFileSync(outputPath, content);
+        console.log(`Successfully saved file to ${outputPath}`);
+        return true;
+    } catch (error) {
+        console.error('Error saving file:', error);
+        console.error('Error details:', error.message);
+        throw error;
+    }
+}
 
-    const title = await page.$eval('h1', el => el.innerText);
-    const sections = await page.$$eval('h2, p, pre', nodes => nodes.map(node => {
-        if (node.tagName === 'H2') return `## ${node.innerText}`;
-        if (node.tagName === 'P') return node.innerText;
-        if (node.tagName === 'PRE') return `\`\`\`\n${node.innerText}\n\`\`\``;
-    }));
+async function initiateScrapingJob(url, maxDepth, force = false) {
+    console.log('\n=== Starting new scraping job ===');
+    console.log('URL:', url);
+    console.log('Max depth:', maxDepth);
+    console.log('Force:', force);
 
-    const mdContent = `# ${title}\n\n` + sections.join('\n\n');
-    fs.writeFileSync('langchain_documentation.md', mdContent);
-    console.log("Markdown file saved successfully!");
+    // Reset global state
+    visitedUrls.clear();
+    urlToFileMap.clear();
 
-    await browser.close();
-})();
+    try {
+        const result = await scrapeWebsite(url, maxDepth);
+        if (!result) {
+            throw new Error('Scraping failed - no content retrieved');
+        }
+        return result;
+    } catch (error) {
+        console.error('Scraping job failed:', error);
+        throw error;
+    }
+}
+
+module.exports = {
+    scrapeWebsite,
+    saveToMarkdown,
+    initiateScrapingJob
+};
+
+
 ```
 
 **Best Practices**:
@@ -115,7 +336,7 @@ const md = new MarkdownIt();
 ---
 
 ### 3. **Data Indexing and Storage**
-**Directory**: `backend/indexData.js`
+**Directory**: `backend/utils/indexData.js`
 
 ```javascript
 const fs = require('fs');
@@ -159,25 +380,80 @@ module.exports = { indexData };
 
 ```javascript
 const express = require('express');
-const multer = require('multer');
-const fs = require('fs');
-const { indexData } = require('../utils/indexData');
-
-const upload = multer({ dest: 'uploads/' });
 const router = express.Router();
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 
-router.post('/upload-markdown', upload.single('file'), async (req, res) => {
-  try {
-    const filePath = req.file.path;
-    const markdownContent = fs.readFileSync(filePath, 'utf-8');
-    
-    await indexData(markdownContent);
+// Configure multer for file upload
+const storage = multer.diskStorage({
+    destination: function (req, file, cb) {
+        const uploadPath = path.join(__dirname, '../uploads');
+        if (!fs.existsSync(uploadPath)) {
+            fs.mkdirSync(uploadPath, { recursive: true });
+        }
+        cb(null, uploadPath);
+    },
+    filename: function (req, file, cb) {
+        cb(null, `${Date.now()}-${file.originalname}`);
+    }
+});
 
-    res.status(200).send('File uploaded and indexed successfully.');
-  } catch (error) {
-    console.error('Error uploading file:', error);
-    res.status(500).send('An error occurred while uploading and indexing the file.');
-  }
+const upload = multer({ 
+    storage: storage,
+    fileFilter: (req, file, cb) => {
+        if (path.extname(file.originalname).toLowerCase() === '.md') {
+            cb(null, true);
+        } else {
+            cb(new Error('Only markdown files are allowed'));
+        }
+    }
+});
+
+router.post('/', upload.single('file'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({
+                error: true,
+                message: 'No file uploaded'
+            });
+        }
+
+        res.status(200).json({
+            message: 'File uploaded successfully',
+            filename: req.file.filename,
+            path: req.file.path
+        });
+    } catch (error) {
+        console.error('Upload error:', error);
+        res.status(500).json({
+            error: true,
+            message: error.message
+        });
+    }
+});
+
+router.get('/files', (req, res) => {
+    try {
+        const uploadsPath = path.join(__dirname, '../uploads');
+        const files = fs.readdirSync(uploadsPath)
+            .filter(file => file.endsWith('.md'))
+            .map(file => ({
+                name: file,
+                path: path.join(uploadsPath, file),
+                created: fs.statSync(path.join(uploadsPath, file)).birthtime
+            }));
+
+        res.status(200).json({
+            files: files
+        });
+    } catch (error) {
+        console.error('Error listing files:', error);
+        res.status(500).json({
+            error: true,
+            message: error.message
+        });
+    }
 });
 
 module.exports = router;
@@ -194,40 +470,94 @@ module.exports = router;
 
 ```javascript
 const express = require('express');
-const puppeteer = require('puppeteer');
-const { indexData } = require('../utils/indexData');
-
+const path = require('path');
+const fs = require('fs');
 const router = express.Router();
+const scraper = require('../scrape');
 
-router.post('/scrape-url', async (req, res) => {
-  const { url } = req.body;
+router.post('/', async (req, res) => {
+    try {
+        const { url, maxDepth = 3, force = false } = req.body;
+        if (!url) {
+            return res.status(400).json({
+                error: true,
+                message: 'URL is required'
+            });
+        }
 
-  try {
-    const browser = await puppeteer.launch();
-    const page = await browser.newPage();
-    await page.goto(url, { waitUntil: 'networkidle2' });
+        console.log('Starting scrape:', { url, maxDepth, force });
+        
+        // Clear existing files if force is true
+        if (force) {
+            const uploadsPath = path.join(__dirname, '../uploads');
+            if (fs.existsSync(uploadsPath)) {
+                fs.readdirSync(uploadsPath)
+                    .filter(file => file.endsWith('.md'))
+                    .forEach(file => {
+                        fs.unlinkSync(path.join(uploadsPath, file));
+                    });
+                console.log('Cleared existing files for forced scrape');
+            }
+        }
+        
+        const startTime = Date.now();
+        const result = await scraper.initiateScrapingJob(url, maxDepth, force);
+        const endTime = Date.now();
+        const timeElapsed = (endTime - startTime) / 1000;
 
-    const content = await page.evaluate(() => {
-      const title = document.querySelector('h1')?.innerText || 'No Title';
-      const sections = Array.from(document.querySelectorAll('h2, p, pre')).map(node => {
-        if (node.tagName === 'H2') return `## ${node.innerText}`;
-        if (node.tagName === 'P') return node.innerText;
-        if (node.tagName === 'PRE') return `\`\`\`\n${node.innerText}\n\`\`\``;
-      });
-      return `# ${title}\n\n` + sections.join('\n\n');
-    });
+        // Count files in uploads directory
+        const uploadsPath = path.join(__dirname, '../uploads');
+        const filesCount = fs.existsSync(uploadsPath) 
+            ? fs.readdirSync(uploadsPath).filter(file => file.endsWith('.md')).length
+            : 0;
 
-    await indexData(content);
+        res.status(200).json({
+            message: 'Scraping completed',
+            startUrl: url,
+            maxDepth,
+            timeElapsed: `${timeElapsed} seconds`,
+            filesProcessed: filesCount,
+            result
+        });
 
-    res.status(200).send('URL content scraped and indexed successfully.');
-    await browser.close();
-  } catch (error) {
-    console.error('Error scraping URL:', error);
-    res.status(500).send('An error occurred while scraping and indexing the URL content.');
-  }
+    } catch (error) {
+        console.error('Error:', error);
+        res.status(500).json({
+            error: true,
+            message: error.message,
+            startUrl: req.body.url
+        });
+    }
+});
+
+router.get('/status', (req, res) => {
+    try {
+        const uploadsPath = path.join(__dirname, '../uploads');
+        const files = fs.existsSync(uploadsPath)
+            ? fs.readdirSync(uploadsPath)
+                .filter(file => file.endsWith('.md'))
+                .map(file => ({
+                    name: file,
+                    size: fs.statSync(path.join(uploadsPath, file)).size,
+                    lastModified: fs.statSync(path.join(uploadsPath, file)).mtime
+                }))
+            : [];
+
+        res.status(200).json({
+            totalFiles: files.length,
+            files: files.sort((a, b) => b.lastModified - a.lastModified)
+        });
+    } catch (error) {
+        console.error('Error getting status:', error);
+        res.status(500).json({
+            error: true,
+            message: error.message
+        });
+    }
 });
 
 module.exports = router;
+
 ```
 
 **Best Practices**:
@@ -295,37 +625,49 @@ export default UpdateContent;
 **Directory**: `backend/server.js`
 
 ```javascript
-require('dotenv').config();
+//require('dotenv').config();
 const express = require('express');
-const axios = require('axios');
-const uploadMarkdown = require('./routes/uploadMarkdown');
-const scrapeUrl = require('./routes/scrapeUrl');
+const dotenv = require('dotenv');
+const path = require('path');
+const fs = require('fs'); 
+
+dotenv.config();
+
+// Import routes
+const uploadRouter = require('./routes/uploadMarkdown');
+const scrapeRouter = require('./routes/scrapeUrl');
 
 const app = express();
+
+// Middleware
 app.use(express.json());
-app.use('/api', uploadMarkdown);
-app.use('/api', scrapeUrl);
 
-app.post('/query', async (req, res) => {
-  const { input } = req.body;
-  try {
-    const response = await axios.post('https://api.openai.com/v1/engines/davinci-codex/completions', {
-      prompt: input,
-      max_tokens: 150
-    }, {
-      headers: {
-        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
-      }
+// Ensure uploads directory exists
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) {
+    console.log('Creating uploads directory:', uploadsDir);
+    fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+// Routes
+app.use('/api/upload', uploadRouter);
+app.use('/api/scrape', scrapeRouter);
+app.use('/api/url/scrape', scrapeRouter); // Add alias route
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+    console.error(err.stack);
+    res.status(500).json({
+        error: true,
+        message: err.message || 'Internal Server Error'
     });
-
-    res.json(response.data.choices[0].text.trim());
-  } catch (error) {
-    console.error('Error querying LLM:', error);
-    res.status(500).send('An error occurred while fetching the response.');
-  }
 });
 
-app.listen(3000, () => console.log('Server running on port 3000'));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+});
+
 ```
 
 **Best Practices**:
